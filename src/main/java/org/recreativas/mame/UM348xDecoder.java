@@ -25,7 +25,6 @@ import java.util.Set;
  *  Based on previous work from:
  *   - Sean Riddle: https://www.seanriddle.com/um348x/
  *   - ArcadeHacker: https://arcadehacker.blogspot.com/2020/07/um3481a-series-multi-instrument-melody.html
- *
  * ============================================================================
  *
  * INPUT
@@ -64,13 +63,33 @@ import java.util.Set;
  * The 448-byte note ROM is read row-major: row r (0-63), 7 bytes per row (one
  * per physical column-group g, 0-6). Each byte holds that group's bit for the
  * 8 "sub-columns" sharing the row; sub-column s (0-7) is bit s of the byte
- * (s = 0 -> least-significant). Notes number sequentially within a sub-column
- * before advancing:
+ * (s = 0 -> least-significant).
  *
- *     noteIndex = subColumn * 64 + row                    (0..511)
+ * Melodies do NOT run through the sub-columns in the order 0..7. The logical
+ * order is:
  *
- * giving 512 addressable notes. One scheme decodes both devices, and melodies
- * decoded this way match their recordings note for note (section 7).
+ *     0, 1, 2, 3, 7, 6, 5, 4          (SUBCOLUMN_ORDER)
+ *
+ * i.e. the second half of the array is traversed in reverse, so:
+ *
+ *     noteIndex = position_in_SUBCOLUMN_ORDER * 64 + row      (0..511)
+ *
+ * Three independent lines of evidence fix this order:
+ *
+ *   - Melody continuity. Aligning a whole UM3481A recording against the ROM as
+ *     one uninterrupted stream, the match runs perfectly for 190 notes and
+ *     then stops dead at logical index 256 -- exactly a sub-column boundary
+ *     (4 x 64). The notes that follow are found at physical sub-column 7, not
+ *     4. Fixing the order to 0,1,2,3,7,6,5,4 makes every non-staccato melody
+ *     in both UM3481A recordings align exactly with its slot: 58, 63, 41, 42,
+ *     21, 57 and 56 notes, 100% of them, in slot order.
+ *   - Slot pointers land correctly. A second UM3481A capture, holding that
+ *     device's last melodies, aligns 134 of 134 notes starting precisely at
+ *     ROM index 329, which is offsets[5] -- the start of slot 6.
+ *   - UM3482A slot occupancy becomes sane. Under the naive 0..7 order that
+ *     device has two slots containing nothing but rests and one slot of 97
+ *     melodic words, three times any other. Under the correct order no slot is
+ *     empty and slot sizes run a uniform 14 to 38 words.
  *
  * ----------------------------------------------------------------------------
  * 2. NOTE WORD FORMAT AND SLOT POINTERS
@@ -194,25 +213,28 @@ import java.util.Set;
  * ----------------------------------------------------------------------------
  * 5. CONSECUTIVE REPEATED-TONE WORDS
  * ----------------------------------------------------------------------------
- * Consecutive ROM words carrying the same tone code are rendered by the
- * hardware as ONE uninterrupted tone, not as separately re-articulated notes.
- * Two independent lines of evidence:
+ * A run of consecutive ROM words carrying the same tone code may be rendered
+ * either as one sustained note or as several re-articulated ones -- alignment
+ * against the recordings requires allowing both, and a melody generally
+ * cannot be matched at all if runs are forced to collapse completely.
  *
- *   - Structural: across all recordings, adjacent audible notes essentially
- *     never share a pitch (2 occurrences in ~370 adjacent pairs, both
- *     consistent with edge-detection noise). If repeated words re-triggered,
- *     same-pitch neighbours would be common, since such runs are frequent in
- *     the ROM (68 runs of length 2-4 in the UM3482A note data alone).
- *   - Alignment: treating runs as single notes is what makes whole melodies
- *     line up exactly with their recordings; treating each word as its own
- *     note does not.
+ * This distinction cannot be settled from the captures available, for a
+ * mundane reason: the edge-extraction step used to read them merges any
+ * uninterrupted stretch of one period into a single note event, so a genuine
+ * re-articulation of the same pitch with no intervening silence is
+ * indistinguishable from one long note. Any apparent absence of same-pitch
+ * neighbours in the extracted data is an artefact of that step, not a
+ * property of the device.
  *
- * The consequence for synthesis is waveform CONTINUITY rather than duration:
- * each note must not restart its square wave at phase zero, or a run of
- * same-frequency words acquires an audible discontinuity at each internal
- * boundary that the hardware does not produce. A single song-wide sample
- * counter supplies the phase, so equal-pitch runs render seamlessly while
- * genuine pitch changes still switch abruptly, as the captures show.
+ * Fortunately this does not affect synthesis. Whichever way a run is voiced,
+ * its total length is the sum of the member words' ticks (section 4), and
+ * notes are rendered back to back with no gap, so simply emitting each word in
+ * turn produces the correct total duration either way. What does matter is
+ * waveform CONTINUITY: if each word restarted its square wave at phase zero, a
+ * run of equal-pitch words would acquire a discontinuity at every internal
+ * boundary. A single song-wide sample counter supplies the phase instead, so
+ * such runs render smoothly while genuine pitch changes still switch abruptly,
+ * as the captures show.
  *
  * ----------------------------------------------------------------------------
  * 6. TEMPO
@@ -226,7 +248,15 @@ import java.util.Set;
  *     UM3481A slot 2      44            4         81.92 ms
  *     UM3481A slot 3      41            6        122.88 ms
  *     UM3481A slot 4      80            3         61.44 ms
+ *     UM3481A slot 6      36            5        102.40 ms
+ *     UM3481A slot 7      54            4         81.92 ms
+ *     UM3481A slot 8      91            6        122.88 ms
  *     UM3482A slot 9     126            5        102.40 ms
+ *     UM3482A slot 11     88            3         61.44 ms
+ *
+ * Each figure is the median of the per-note ratio between measured length and
+ * predicted ticks across a fully aligned melody, and every one lands within
+ * 0.1% of an integer.
  *
  * Multipliers measured this way are applied per slot (see
  * TEMPO_MULTIPLIER_OVERRIDES); every other slot uses 5, the most frequently
@@ -300,10 +330,11 @@ import java.util.Set;
  *      (7.484 x code 0, sd 0.003) is followed here, but with low confidence.
  *
  * 9.5  THE TEMPO MULTIPLIER CANNOT BE DERIVED FROM THE TEMPO BYTE.
- *      Bytes 72 and 126 both yield multiplier 5; bytes 41, 44, 72 and 80 --
- *      close in value, and 41/44 adjacent in the table -- yield 6, 4, 5 and 3
- *      respectively. No linear, proportional, modular, bitwise or bit-reversed
- *      function of the byte fits these five points.
+ *      Nine multipliers are now measured. Bytes 72 and 36 both yield 5; bytes
+ *      44 and 54 both yield 4; bytes 41 and 91 both yield 6; byte 80 yields 3.
+ *      No linear, proportional, modular, bitwise or bit-reversed function of
+ *      the byte fits, and pairs that agree are not related by any obvious
+ *      transform.
  *
  *      There is stronger evidence that this ROM is not per-song tempo data at
  *      all: the two devices carry entirely different song sets, yet their
@@ -311,20 +342,43 @@ import java.util.Set;
  *      identical in both (44, 41, 80, 14, 36, 54, 91, 126) and the remainder
  *      looking like the same underlying sequence shifted by an insertion. A
  *      genuine per-song tempo table for two unrelated song sets would not
- *      agree like that. What this ROM selects is unresolved.
+ *      agree like that.
+ *
+ *      A different source looks more promising and is worth pursuing: the
+ *      multiplier correlates with the words at the head of each slot. On the
+ *      UM3481A, slots whose second word is an ordinary note take multiplier 4
+ *      (slots 2 and 7); slots whose second word is a rest with duration code 1
+ *      take 6 (slots 3 and 8); slots whose second word is a control word with
+ *      duration code 3 take 5 (slots 1 and 6); and the one slot whose control
+ *      word carries duration code 1 takes 3 (slot 4). Every UM3481A slot fits
+ *      this description, but with seven data points and four outcomes it could
+ *      easily be coincidence, and it has not been checked against the UM3482A.
  *
  *      Consequence: slots without a measured multiplier have correct pitch and
  *      correct relative rhythm but may play at the wrong absolute speed, by a
  *      ratio of 3/5, 4/5 or 6/5.
  *
- * 9.6  THE OFFSETS TABLE DOES NOT DELIMIT SONGS ONE-TO-ONE.
- *      Slot 16 of the UM3482A spans 104 words and contains four internal
- *      rest+control markers (section 3a), and two of its disjoint regions
- *      match two different recorded melodies at two different tempo
- *      multipliers. The true song boundaries are therefore not simply
- *      consecutive offsets. This program still cuts melodies at offset
- *      boundaries, so oversized slots may contain more than one melody and
- *      undersized ones may be truncated.
+ * 9.6  THE REAL UM3482A RECORDINGS FROM SEAN'S SITE AND ITS ROM DUMP DO NOT AGREE.
+ *      Only 3 of that device's 12 recorded melodies can be located in its ROM,
+ *      and the failures are not explained by the missing table entries: an
+ *      exhaustive search over every injective assignment of the five
+ *      unmeasured tone codes to the device's unassigned observed pitches
+ *      produces no assignment that makes any further melody align. Nor is it a
+ *      boundary problem -- with the tone table left entirely free, so that only
+ *      the pattern of which notes repeat which has to match, those melodies
+ *      still align nowhere in the ROM at all.
+ *
+ *      Two counts show the disagreement is structural. The recordings contain
+ *      479 notes while the ROM holds 399 melodic words, and a word can only
+ *      ever produce one note or be merged into one, so the recording cannot be
+ *      generated by this ROM as decoded. Individually, the first recorded
+ *      melody has 52 notes while the largest slot holds 38 words.
+ *
+ *      The likeliest explanations are that the UM3482A captures come from a
+ *      different ROM revision than the dump, or that they were spliced when
+ *      two melodies were removed to reduce file size, joining fragments of
+ *      different melodies into what looks like one. Note that the UM3481A,
+ *      whose captures were not spliced in this way, aligns perfectly.
  *
  * 9.7  STACCATO / TREMOLO ARTICULATION IS NOT REPRODUCED.
  *      One melody in each device's recordings (UM3481A melody 5, UM3482A
@@ -335,15 +389,11 @@ import java.util.Set;
  *      distinguishes these melodies, so the selector lives outside the note
  *      ROM. Those melodies render here as ordinary sustained tones.
  *
- * 9.8  SEVEN OF THE TEN RECORDED UM3482A MELODIES DO NOT ALIGN ANYWHERE.
- *      Using only the seven measured UM3482A tone codes as anchors, these
- *      melodies reach at best 25-63% agreement against any ROM window, where a
- *      correct alignment scores 100%. An exhaustive search over all injective
- *      assignments of the five unmeasured codes to the device's unassigned
- *      observed pitches produces no assignment that makes any of them align,
- *      so the cause is not the missing table entries. The most likely
- *      explanation is 9.6: those melodies span ROM regions that the offset
- *      boundaries cut incorrectly.
+ * 9.8  THE UM3481A STACCATO MELODY (SLOT 5) IS THE ONE UNALIGNED UM3481A SONG.
+ *      Every other melody on that device matches its slot exactly. Slot 5
+ *      cannot be aligned because its articulation (9.7) multiplies the audible
+ *      event count, so its tempo multiplier is unmeasured and it falls back to
+ *      the default.
  *
  * 9.9  A PITCH-RANGE MECHANISM MAY EXIST OUTSIDE THE NOTE WORD.
  *      Across both devices 17 distinct note periods occur, while a single
@@ -355,23 +405,25 @@ import java.util.Set;
  * ----------------------------------------------------------------------------
  * PER-SLOT CONFIDENCE
  * ----------------------------------------------------------------------------
- *   UM3481A slots 1-4    Highest confidence available: pitch and rhythm both
- *                        validated against a recording, tempo multiplier
- *                        measured directly, and the full tone table for this
- *                        device is measured.
- *   UM3481A slots 5-8    Full measured tone table applies, so pitch is
- *                        trustworthy; tempo multiplier unmeasured. Slot 5 is
- *                        the staccato-articulated melody (9.7).
- *   UM3482A slots 7, 9   Pitch validated exactly against recordings; slot 9
- *   and part of 16       also has its multiplier measured directly.
- *   UM3482A slots        Marked "~" in the run output: these contain at least
- *   2,4,5,6,8,10,14,16   one tone code whose frequency is estimated rather
- *                        than measured (9.1). Pitch contour is right in
- *                        outline but individual notes may be wrong.
- *   All remaining slots  Decoded with the same tables, but with no direct
- *                        playback comparison and no measured multiplier;
- *                        expect correct relative rhythm, possibly wrong
- *                        absolute speed.
+ *   UM3481A slots       Highest confidence: each aligns exactly with a
+ *   1,2,3,4,6,7,8       recording (58, 63, 41, 42, 21, 57 and 56 notes, all
+ *                       100%), the device's full tone table is measured, and
+ *                       each multiplier is read directly off the recording.
+ *                       Generated length lands within 0.6-2.0% of the capture
+ *                       for six of the seven, and 6.8% for the shortest.
+ *   UM3481A slot 5      Pitch trustworthy (full measured tone table); tempo
+ *                       multiplier unmeasured, and its staccato articulation
+ *                       is not reproduced (9.7, 9.8).
+ *   UM3482A slots       These align with recordings; slot 9 also has its
+ *   9 and 11            multiplier measured directly.
+ *   UM3482A slots       Marked "~" in the run output: these contain at least
+ *   2,4,5,6,8,10,14,16  one tone code whose frequency is estimated rather than
+ *                       measured (9.1). Pitch contour is right in outline but
+ *                       individual notes may be wrong.
+ *   All other UM3482A   Decoded with the same tables, but that device's
+ *   slots               recordings cannot be reconciled with its ROM dump
+ *                       (9.6), so none of them has a direct playback check and
+ *                       none has a measured multiplier.
  *
  * ----------------------------------------------------------------------------
  * USAGE
@@ -383,11 +435,10 @@ import java.util.Set;
  * The input directory is scanned for either or both devices' ROM sets; each
  * device found is decoded and its melodies written as <chip>_melody_NN.wav.
  * Recognised note-ROM names are um3481araw.bin and um3482araw.bin; offsets and
- * tempos are located by matching prefix, falling back to the bare names
- * offsets.bin / tempos.bin.
+ * tempos are located by matching prefix.
  * ============================================================================
  */
-public final class UM348xDecoder {
+public class UM348xDecoder {
 
     // ------------------------------------------------------------------
     // Section 1: physical note-ROM geometry.
@@ -395,6 +446,13 @@ public final class UM348xDecoder {
     static final int ROM_ROWS = 64;
     static final int ROM_GROUPS = 7;
     static final int SUBCOLUMNS = 8;
+
+    /**
+     * Logical melody order visits the physical sub-columns in this order, not
+     * 0..7: the second half of the array is traversed in reverse. See
+     * section 1.
+     */
+    static final int[] SUBCOLUMN_ORDER = {0, 1, 2, 3, 7, 6, 5, 4};
     static final int TOTAL_NOTES = ROM_ROWS * SUBCOLUMNS; // 512
     static final int EXPECTED_ROM_BYTES = ROM_ROWS * ROM_GROUPS; // 448
 
@@ -461,16 +519,14 @@ public final class UM348xDecoder {
         100   // 15 1000.00 Hz  ESTIMATED, see 9.1
     };
 
-    /** TODO: Codes whose period is an estimate rather than a measurement, per chip. */
-    static final Set<Integer> ESTIMATED_UM3482A = new HashSet<>(
-		Arrays.asList(
-			Integer.valueOf(7),
-			Integer.valueOf(9),
-			Integer.valueOf(13),
-			Integer.valueOf(14),
-			Integer.valueOf(15)
-		)
-	);
+    /** Codes whose period is an estimate rather than a measurement, per chip. */
+    static final Set<Integer> ESTIMATED_UM3482A = new HashSet<>(Arrays.asList(
+		Integer.valueOf(7),
+		Integer.valueOf(9),
+		Integer.valueOf(13),
+		Integer.valueOf(14),
+		Integer.valueOf(15)
+	));
 
     static int[] periodTableFor(final String chip) {
         return "UM3481A".equals(chip) ? PERIODS_UM3481A : PERIODS_UM3482A; //$NON-NLS-1$
@@ -513,16 +569,24 @@ public final class UM348xDecoder {
 
     static final Map<String, Integer> TEMPO_MULTIPLIER_OVERRIDES = new HashMap<>();
     static {
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:1", Integer.valueOf(5)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:2", Integer.valueOf(4)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:3", Integer.valueOf(6)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:4", Integer.valueOf(3)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3482A:9", Integer.valueOf(5)); //$NON-NLS-1$
+        // UM3481A: every non-staccato melody aligns exactly with its slot, so
+        // each multiplier below is read straight off the recording.
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:1",  Integer.valueOf(5)); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:2",  Integer.valueOf(4)); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:3",  Integer.valueOf(6)); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:4",  Integer.valueOf(3)); //$NON-NLS-1$
+        // slot 5 is the staccato melody and could not be aligned
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:6",  Integer.valueOf(5)); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:7",  Integer.valueOf(4)); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:8",  Integer.valueOf(6)); //$NON-NLS-1$
+        // UM3482A: only these two slots align cleanly, see 9.8.
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3482A:9",  Integer.valueOf(5)); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3482A:11", Integer.valueOf(3)); //$NON-NLS-1$
     }
 
     static int tempoMultiplier(final String chip, final int slot1Based) {
         final var m = TEMPO_MULTIPLIER_OVERRIDES.get(chip + ":" + slot1Based); //$NON-NLS-1$
-        return m != null ? m.intValue() : DEFAULT_TEMPO_MULTIPLIER;
+        return m != null ? m : DEFAULT_TEMPO_MULTIPLIER;
     }
 
     static double noteDurationMs(final int durationCode, final int multiplier) {
@@ -544,9 +608,10 @@ public final class UM348xDecoder {
         int songCount;   // number of real melodies (before pointer filler repeats)
     }
 
-    /** Generate the melody WAV files.
-     * @param args Not used.
-     * @throws IOException If errors reading or writting files. */
+    /** Main method for testing.
+     * @param args Unused.
+     * @throws IOException if any problem reading or writting files.
+     */
     public static void main(final String[] args) throws IOException {
         System.setOut(new PrintStream(System.out, true, java.nio.charset.StandardCharsets.UTF_8));
         System.setErr(new PrintStream(System.err, true, java.nio.charset.StandardCharsets.UTF_8));
@@ -559,7 +624,7 @@ public final class UM348xDecoder {
         if (c1 != null) {
 			chips.add(c1);
 		}
-        final var c2 = loadChip(inputDir, "UM3482A", "um3482araw.bin", "um3482a_offsets.bin", "um3482a_tempos.bin"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+        final var c2 = loadChip(inputDir, "UM3482A", "um3482araw.bin", "um3482_offsets.bin", "um3482_tempos.bin"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
         if (c2 != null) {
 			chips.add(c2);
 		}
@@ -720,7 +785,8 @@ public final class UM348xDecoder {
 
     static int[][] decodeNotes(final byte[] rom) {
         final var notes = new int[TOTAL_NOTES][2];
-        for (var s = 0; s < SUBCOLUMNS; s++) {
+        for (var logical = 0; logical < SUBCOLUMNS; logical++) {
+            final var s = SUBCOLUMN_ORDER[logical];   // physical sub-column
             for (var r = 0; r < ROM_ROWS; r++) {
                 var word = 0;
                 for (var g = 0; g < ROM_GROUPS; g++) {
@@ -728,8 +794,8 @@ public final class UM348xDecoder {
                     final var b = byteIndex < rom.length ? rom[byteIndex] & 0xFF : 0;
                     word = word << 1 | b >> s & 1;
                 }
-                notes[s * ROM_ROWS + r][0] = word >> 4 & 0x7; // duration
-                notes[s * ROM_ROWS + r][1] = word & 0xF;         // tone
+                notes[logical * ROM_ROWS + r][0] = word >> 4 & 0x7; // duration
+                notes[logical * ROM_ROWS + r][1] = word & 0xF;         // tone
             }
         }
         return notes;
@@ -819,7 +885,8 @@ public final class UM348xDecoder {
 
     static void writeWav(final String path, final short[] samples, final int sampleRate) throws IOException {
         final var dataSize = samples.length * 2;
-        try (var out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(path)))) {
+        try (var out = new DataOutputStream(
+                new BufferedOutputStream(new FileOutputStream(path)))) {
             out.writeBytes("RIFF"); //$NON-NLS-1$
             writeLE32(out, 36 + dataSize);
             out.writeBytes("WAVE"); //$NON-NLS-1$
