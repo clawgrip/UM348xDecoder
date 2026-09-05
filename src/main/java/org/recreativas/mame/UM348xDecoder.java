@@ -687,13 +687,13 @@ public class UM348xDecoder {
     // Section 4: measured duration code -> ticks (smallest duration = 1).
     // ------------------------------------------------------------------
     static final int[] DURATION_TICKS = {
-         2,  // 0  counted directly, 24 notes
-         3,  // 1  not measured, see 11.4
+         2,  // 0  counted directly, 20 notes
+         3,  // 1  from boundary silences only, see 11.4
         15,  // 2  counted directly, 4 notes
          4,  // 3  counted directly, 24 notes
-         1,  // 4  not measured, see 11.4
+         1,  // 4  from boundary silences only, see 11.4
          8,  // 5  from duration ratios
-        12,  // 6  counted directly, in a run
+        12,  // 6  counted directly, 4 notes in a run
          6   // 7  from duration ratios
     };
 
@@ -730,14 +730,14 @@ public class UM348xDecoder {
         TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:7", Integer.valueOf(4)); //$NON-NLS-1$
         TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:8", Integer.valueOf(6)); //$NON-NLS-1$
         // UM3482A: slot 9 is the only one whose alignment is clean enough to
-        // measure (deviation 0.6%; every other candidate alignment on that
+        // measure (deviation 0.37%; every other candidate alignment on that
         // device yields a non-integer multiplier).
         TEMPO_MULTIPLIER_OVERRIDES.put("UM3482A:9", Integer.valueOf(5)); //$NON-NLS-1$
     }
 
     static int tempoMultiplier(final String chip, final int slot1Based) {
         final var m = TEMPO_MULTIPLIER_OVERRIDES.get(chip + ":" + slot1Based); //$NON-NLS-1$
-        return m != null ? m.intValue() : DEFAULT_TEMPO_MULTIPLIER;
+        return m != null ? m : DEFAULT_TEMPO_MULTIPLIER;
     }
 
     static double noteDurationMs(final int durationCode, final int multiplier) {
@@ -993,8 +993,12 @@ public class UM348xDecoder {
     }
 
     /**
-     * Reject pointer tables that cannot describe a melody layout: the first
-     * pointer must be in range, and the leading run must not decrease.
+     * Reject pointer tables that cannot describe a melody layout. Every
+     * pointer must address a word that exists, and the first must do so in
+     * particular, since it is where the first melody begins. Ordering is not
+     * checked here: the leading increasing run is what defines the melodies,
+     * and {@link #countRealSongs(int[], int)} stops at the first pointer that
+     * breaks it.
      *
      * @param offsets Parsed pointers.
      * @throws IllegalArgumentException if the table is unusable.
@@ -1003,9 +1007,11 @@ public class UM348xDecoder {
         if (offsets.length == 0) {
             throw new IllegalArgumentException("offsets table is empty"); //$NON-NLS-1$
         }
-        if (offsets[0] < 0 || offsets[0] >= TOTAL_NOTES) {
-            throw new IllegalArgumentException("first melody pointer is " + offsets[0] //$NON-NLS-1$
-                    + ", outside 0.." + (TOTAL_NOTES - 1)); //$NON-NLS-1$
+        for (var i = 0; i < offsets.length; i++) {
+            if (offsets[i] < 0 || offsets[i] >= TOTAL_NOTES) {
+                throw new IllegalArgumentException("melody pointer " + i + " is " + offsets[i] //$NON-NLS-1$ //$NON-NLS-2$
+                        + ", outside 0.." + (TOTAL_NOTES - 1)); //$NON-NLS-1$
+            }
         }
     }
 
@@ -1018,8 +1024,13 @@ public class UM348xDecoder {
     }
 
     /**
-     * Real melodies are the strictly increasing leading pointers; the trailing
-     * repeated filler value marks unused slots (section 2).
+     * Count the melodies a pointer table actually describes: the leading run
+     * of strictly increasing pointers, minus any that address the ROM's
+     * trailing filler (section 2).
+     *
+     * @param offsets Parsed pointers.
+     * @param dataEnd Index of the last word that can sound.
+     * @return Number of melodies, possibly zero.
      */
     static int countRealSongs(final int[] offsets, final int dataEnd) {
         if (offsets.length == 0) {
@@ -1058,6 +1069,12 @@ public class UM348xDecoder {
     // NOTE-ROM DECODING  (sections 1-2)
     // ========================================================================
 
+    /**
+     * Decode the 448-byte note array into 512 words of duration and tone.
+     *
+     * @param rom Raw note ROM; must be exactly {@link #EXPECTED_ROM_BYTES} long.
+     * @return One {duration, tone} pair per note index.
+     */
     static int[][] decodeNotes(final byte[] rom) {
         final var notes = new int[TOTAL_NOTES][2];
         for (var logical = 0; logical < SUBCOLUMNS; logical++) {
@@ -1065,8 +1082,7 @@ public class UM348xDecoder {
             for (var r = 0; r < ROM_ROWS; r++) {
                 var word = 0;
                 for (var g = 0; g < ROM_GROUPS; g++) {
-                    final var byteIndex = r * ROM_GROUPS + g;
-                    final var b = byteIndex < rom.length ? rom[byteIndex] & 0xFF : 0;
+                    final var b = rom[r * ROM_GROUPS + g] & 0xFF;
                     word = word << 1 | b >> s & 1;
                 }
                 notes[logical * ROM_ROWS + r][0] = word >> 4 & 0x7; // duration
