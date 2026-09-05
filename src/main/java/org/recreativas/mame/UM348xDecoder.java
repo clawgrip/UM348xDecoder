@@ -6,37 +6,46 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * ============================================================================
  *  UM348xDecoder
  *  Reverse-engineered ROM decoder and WAV synthesizer for the UM348x family of
- *  melody-generator ICs. Verified against two devices: the UM3481A
- *  (8 melodies) and the UM3482A (12 melodies).
+ *  melody-generator ICs. Verified against two devices: a UM3481A playing 8
+ *  melodies and a UM3482A playing 12.
+ *
+ *  Melody count and slot count are different things. Both parts have 16
+ *  addressable slots, and both dumps fill all 16 pointers, so this program
+ *  renders 16 WAVs per part. The recorded devices play fewer: the UM3481A
+ *  stops after 8, and the recorded UM3482A after 12. Which pointers a part
+ *  actually exposes is not visible in the dumps.
  * ============================================================================
  *
  * INPUT
  * -----
  * Per device, three raw ROM dumps:
  *
- *   &lt;chip&gt;raw.bin     (448 bytes)  Main note ROM. 448 bytes = 3584 bits =
+ *   [chip]raw.bin     (448 bytes)  Main note ROM. 448 bytes = 3584 bits =
  *                                  64 rows x 56 columns, matching the physical
  *                                  cell array reported from die inspection of
  *                                  this family: 7 groups of 8 columns.
  *
- *   &lt;chip&gt;offsets.bin              Melody start pointers, one per addressable
+ *   [chip]offsets.bin              Melody start pointers, one per addressable
  *                                  slot (see section 2 for the two packings
  *                                  observed).
  *
- *   &lt;chip&gt;tempos.bin  (16 bytes)   One byte per slot, from the ROM bank
+ *   [chip]tempos.bin  (16 bytes)   One byte per slot, from the ROM bank
  *                                  conventionally described as tempo. Its
  *                                  actual role is not established (section 6).
  *
@@ -153,6 +162,21 @@ import java.util.Set;
  * (11.1). Codes 0 and 5 never occur in that ROM.
  *
  * ----------------------------------------------------------------------------
+ * 3a. TONE CODE 1 IS A CONTROL WORD, NOT A NOTE
+ * ----------------------------------------------------------------------------
+ * Raw tone code 1 produces no sound. In every passage that aligns exactly with
+ * a recording, the first audible note corresponds to the ROM word AFTER the
+ * tone-1 word, never to the tone-1 word itself -- confirmed independently on
+ * UM3481A slots 1 and 4 and on UM3482A slot 7.
+ *
+ * Where these words sit is informative. On the UM3482A a rest word immediately
+ * followed by a tone-1 word occurs at nine places, of which four are slot
+ * starts and five are inside slots. It is treated here as a rest: silent, but
+ * consuming its word's duration: the time it takes is established by the
+ * boundary measurements of section 6a, where a control word's silence is
+ * accounted for to within 0.57%. What it selects is open (11.2).
+ *
+ * ----------------------------------------------------------------------------
  * 3b. THE TONE TABLE IS A SET OF 7-BIT CLOCK DIVIDERS
  * ----------------------------------------------------------------------------
  * Every period ever measured on either device is an EVEN number of samples at
@@ -176,11 +200,11 @@ import java.util.Set;
  * agrees: one tick unit is 2048 cycles, i.e. 2^11, a plain binary divider off
  * the same oscillator.
  *
- * The divisor pool is shared by the family. A continuous capture of each
- * device gives 14 distinct divisors apiece, and the UM3482A's set contains no
- * value absent from the UM3481A's: the two simply draw different subsets of
- * one inventory, the UM3482A reaching lower (127, 113, 101) and the UM3481A
- * higher (36, 38, 45). This is the same tone generator with a different melody
+ * The divisor pool is shared by the family. A continuous capture of each device
+ * gives 14 distinct divisors apiece, drawn from a common inventory of 17: the
+ * two sets overlap in 11 values, the UM3482A additionally reaching lower with
+ * 67, 113 and 127 and the UM3481A higher with 36, 38 and 45. Neither set
+ * contains the other. This is the same tone generator with a different melody
  * mask, which is why the per-device frequency tables of section 3 differ only
  * in which divisor each code selects.
  *
@@ -201,20 +225,6 @@ import java.util.Set;
  * to tempo are fixed by the design.
  *
  * ----------------------------------------------------------------------------
- * 3a. TONE CODE 1 IS A CONTROL WORD, NOT A NOTE
- * ----------------------------------------------------------------------------
- * Raw tone code 1 produces no sound. In every passage that aligns exactly with
- * a recording, the first audible note corresponds to the ROM word AFTER the
- * tone-1 word, never to the tone-1 word itself -- confirmed independently on
- * UM3481A slots 1 and 4 and on UM3482A slot 7.
- *
- * Where these words sit is informative. On the UM3482A a rest word immediately
- * followed by a tone-1 word occurs at nine places, of which four are slot
- * starts and five are inside slots. It is treated here as a rest: silent, but
- * consuming its word's duration. What it selects, and whether it consumes time
- * at all, are open (11.2, 11.3).
- *
- * ----------------------------------------------------------------------------
  * 4. DURATION CODE -> TICKS
  * ----------------------------------------------------------------------------
  * Duration is a lookup, not linear in the raw code:
@@ -225,13 +235,16 @@ import java.util.Set;
  * Codes 0, 2, 3 and 6 are established by DIRECT COUNTING. In the staccato
  * melody the device re-articulates each note once per tick (section 8), so the
  * pulses can simply be counted, with no ratios, no multiplier and no
- * calibration involved. An isolated capture of that melody gives 254 pulses
- * across 52 notes and yields, with no exception anywhere:
+ * calibration involved. An isolated capture of that melody yields 254 bursts, of
+ * which the first and last are partial edge artefacts of the capture; the
+ * remaining 252 group into 52 notes and give, with no exception anywhere:
  *
- *     code 0  -> 2 ticks   (24 independent notes, every one exactly 2 pulses)
+ *     code 0  -> 2 ticks   (20 independent notes, every one exactly 2 pulses)
  *     code 3  -> 4 ticks   (24 independent notes, every one exactly 4 pulses)
  *     code 2  -> 15 ticks  ( 4 independent notes, every one exactly 15 pulses)
- *     codes 6+0 in a run -> 14 pulses, so code 6 = 12 ticks
+ *     codes 6+0 in a run -> 14 pulses, so code 6 = 12 ticks ( 4 notes)
+ *
+ * which totals 20*2 + 24*4 + 4*15 + 4*14 = 252.
  *
  * The value 15 for code 2 is therefore exact and not a rounding of 16: a
  * fifteen-pulse note counted four times cannot be sixteen. The same holds for
@@ -239,8 +252,14 @@ import java.util.Set;
  *
  * Codes 5 and 7 come from duration ratios measured on aligned melodies, in
  * units where the shortest observed word is 1 (spread under 1%): code 5 at
- * 3.995 and code 7 at 3.010, giving 8 and 6 ticks. Codes 1 and 4 are not
- * measured (11.4).
+ * 3.995 and code 7 at 3.010, giving 8 and 6 ticks.
+ *
+ * Codes 1 and 4 never occur on a sounding note in either dump, so they cannot
+ * be counted or timed as notes. They are nevertheless measured, on silent
+ * words at melody boundaries (6a): a rest of code 1 occupies 3 ticks and a
+ * control word of code 4 one tick, each confirmed against the modelled
+ * boundary silence. That is weaker evidence than the pulse counts above,
+ * since it rests on the boundary model rather than on a direct count (11.4).
  *
  * ADDITIVITY -- when consecutive words share a tone code, the resulting note's
  * length is the plain SUM of the member words' ticks. The pulse counts confirm
@@ -389,7 +408,8 @@ import java.util.Set;
  * On the UM3482A the gap measures about 93 ms.
  *
  * Grouping consecutive equal-pitch pulses back into notes recovers the melody
- * exactly: 254 pulses reduce to 52 notes whose tone codes match slot 5 word
+ * exactly: after discarding the two partial bursts at the ends of the capture,
+ * 252 pulses reduce to 52 notes whose tone codes match slot 5 word
  * for word, and whose pulse counts match the tick counts of section 4 in every
  * case. This makes the articulation the most precise measuring instrument
  * available on these devices -- it renders the tick counter directly audible,
@@ -469,7 +489,8 @@ import java.util.Set;
  *      no linear, proportional, modular, bitwise or bit-reversed function
  *      fitting. That ROM is in any case suspect as per-song data, since the two
  *      devices carry entirely different song sets yet share 13 of its 16 byte
- *      values, with positions 1-8 identical in both.
+ *      values, with zero-based offsets 1 to 8 identical in both and offset 12
+ *      matching as well.
  *
  *      Nor is it the slot header. Within the UM3481A the header shape predicts
  *      all eight multipliers, but across devices it fails at once: UM3482A slot
@@ -497,7 +518,7 @@ import java.util.Set;
  *      they are pattern coincidences rather than real matches.
  *
  *      The mismatch is structural. The capture holds 479 notes while the ROM
- *      carries real data only up to index 424, everything beyond being rest
+ *      carries real data only up to index 423 inclusive, everything from 424 on being rest
  *      filler, and a word can produce at most one note. The first recorded
  *      melody alone has 52 notes against a largest slot of 38 words. The
  *      failing melodies align nowhere even when the tone table is left
@@ -530,7 +551,7 @@ import java.util.Set;
  *                       check: exact pitch alignment and a directly measured
  *                       multiplier (11.8).
  *   UM3482A slots       Marked "~" in the run output: these contain at least
- *   2,4,5,6,8,10,14,16  one tone code whose frequency is estimated rather than
+ *   2,4,5,6,8,10,15,16  one tone code whose frequency is estimated rather than
  *                       measured (11.1). Pitch contour is right in outline but
  *                       individual notes may be wrong.
  *   All other UM3482A   Decoded with the same tables, but that device's
@@ -543,8 +564,13 @@ import java.util.Set;
  * ----------------------------------------------------------------------------
  * USAGE
  * ----------------------------------------------------------------------------
- *   javac UM348xDecoder.java
- *   java UM348xDecoder [inputDir] [outputDir]
+ *   mvn package
+ *   java -cp target/classes org.recreativas.mame.UM348xDecoder [inputDir] [outputDir]
+ *
+ * or without Maven:
+ *
+ *   javac -d target/classes src/main/java/org/recreativas/mame/UM348xDecoder.java
+ *   java -cp target/classes org.recreativas.mame.UM348xDecoder [inputDir] [outputDir]
  *
  * Both directories are optional (default: current directory, and "output").
  * The input directory is scanned for either or both devices' ROM sets; each
@@ -679,7 +705,7 @@ public class UM348xDecoder {
     // Section 6: tempo. Tick length = multiplier * TEMPO_BASE_UNIT_MS.
     // Multipliers measured directly are listed per device and slot; anything
     // absent falls back to the most commonly observed value. The multiplier
-    // is not derivable from the tempo byte -- see 9.5.
+    // is not derivable from the tempo byte -- see 11.5.
     // ------------------------------------------------------------------
     static final double TEMPO_BASE_UNIT_MS = 20.48; // 2048 oscillator cycles
     static final int DEFAULT_TEMPO_MULTIPLIER = 5;
@@ -730,12 +756,17 @@ public class UM348xDecoder {
         int[][] notes;   // [512][2] = {durationCode, toneCode}
         int[] offsets;   // slot start note indices
         int[] tempos;    // raw tempo bytes
-        int songCount;   // number of real melodies (before pointer filler repeats)
+        int songCount;   // number of real melodies
+        int dataEnd;     // index of the last word that can sound; the rest is filler
     }
 
-    /** Main method for testing.
-     * @param args Unused.
-     * @throws IOException if any problem reading or writting files.
+    /**
+     * Entry point. Decodes every UM348x ROM set found in the input directory
+     * and writes one WAV per melody.
+     *
+     * @param args Optional: input directory (default the current one) and
+     *             output directory (default "output").
+     * @throws IOException if a ROM cannot be read or a WAV cannot be written.
      */
     public static void main(final String[] args) throws IOException {
         System.setOut(new PrintStream(System.out, true, java.nio.charset.StandardCharsets.UTF_8));
@@ -745,11 +776,12 @@ public class UM348xDecoder {
         final var outputDir = args.length > 1 ? args[1] : "output"; //$NON-NLS-1$
 
         final List<Chip> chips = new ArrayList<>();
-        final var c1 = loadChip(inputDir, "UM3481A", "um3481araw.bin", "um3481a_offsets.bin", "um3481a_tempos.bin"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+        final Set<Path> claimed = new HashSet<>();
+        final var c1 = loadChip(inputDir, "UM3481A", "um3481araw.bin", "um3481a_offsets.bin", "um3481a_tempos.bin", claimed); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
         if (c1 != null) {
 			chips.add(c1);
 		}
-        final var c2 = loadChip(inputDir, "UM3482A", "um3482araw.bin", "um3482a_offsets.bin", "um3482a_tempos.bin"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
+        final var c2 = loadChip(inputDir, "UM3482A", "um3482araw.bin", "um3482a_offsets.bin", "um3482a_tempos.bin", claimed); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
         if (c2 != null) {
 			chips.add(c2);
 		}
@@ -768,19 +800,25 @@ public class UM348xDecoder {
                     + "   slot pointers: " + chip.offsets.length //$NON-NLS-1$
                     + "   melodies: " + chip.songCount); //$NON-NLS-1$
             System.out.println();
-            System.out.printf("%-4s %-7s %-7s %-7s %-7s %-6s %-10s %-8s %-4s%n", //$NON-NLS-1$
+            System.out.printf(Locale.ROOT, "%-4s %-7s %-7s %-7s %-7s %-6s %-10s %-8s %-4s%n", //$NON-NLS-1$
                     "#", "start", "end", "words", "tempo", "mult", "duration", "notes", "est"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$ //$NON-NLS-6$ //$NON-NLS-7$ //$NON-NLS-8$ //$NON-NLS-9$
 
             for (var slot = 0; slot < chip.songCount; slot++) {
                 final var start = chip.offsets[slot];
                 var end = slot + 1 < chip.offsets.length
                         ? chip.offsets[slot + 1] - 1 : TOTAL_NOTES - 1;
-                if (end < start) {
-					end = start;
-				}
                 if (end >= TOTAL_NOTES) {
-					end = TOTAL_NOTES - 1;
-				}
+                    end = TOTAL_NOTES - 1;
+                }
+                // Stop at the last word that can sound, so the trailing filler
+                // is not rendered as minutes of silence. Rests that sit before
+                // that point are part of the melody and are kept.
+                if (end > chip.dataEnd) {
+                    end = chip.dataEnd;
+                }
+                if (end < start) {
+                    end = start;
+                }
 
                 final var mult = tempoMultiplier(chip.name, slot + 1);
                 final var tempoByte = slot < chip.tempos.length ? chip.tempos[slot] : -1;
@@ -788,12 +826,12 @@ public class UM348xDecoder {
                 final var audio = synthesizeSong(chip.name, chip.notes, start, end, mult);
                 final var melodic = countMelodic(chip.notes, start, end);
 
-                final var filename = String.format("%s_melody_%02d.wav", chip.name.toLowerCase(), slot + 1); //$NON-NLS-1$
+                final var filename = String.format(Locale.ROOT, "%s_melody_%02d.wav", chip.name.toLowerCase(), slot + 1); //$NON-NLS-1$
                 writeWav(Paths.get(outputDir, filename).toString(), audio, SAMPLE_RATE);
 
                 final var measured = TEMPO_MULTIPLIER_OVERRIDES.containsKey(chip.name + ":" + (slot + 1)); //$NON-NLS-1$
                 final var estTone = slotUsesEstimatedTone(chip.name, chip.notes, start, end);
-                System.out.printf("%-4d %-7d %-7d %-7d %-7d %-6s %7.2f s  %-8d %-4s -> %s%n", //$NON-NLS-1$
+                System.out.printf(Locale.ROOT, "%-4d %-7d %-7d %-7d %-7d %-6s %7.2f s  %-8d %-4s -> %s%n", //$NON-NLS-1$
                         slot + 1, start, end, end - start + 1, tempoByte,
                         mult + (measured ? "*" : ""), //$NON-NLS-1$ //$NON-NLS-2$
                         audio.length / (double) SAMPLE_RATE, melodic,
@@ -816,38 +854,110 @@ public class UM348xDecoder {
     // ========================================================================
 
     static Chip loadChip(final String dir, final String name, final String romFile,
-                         final String offsetsFile, final String temposFile) throws IOException {
+                         final String offsetsFile, final String temposFile,
+                         final Set<Path> claimed) throws IOException {
         final var rom = Paths.get(dir, romFile);
         if (!Files.exists(rom)) {
-			return null;
-		}
+            return null;
+        }
 
-        var off = Paths.get(dir, offsetsFile);
-        if (!Files.exists(off)) {
-			off = Paths.get(dir, "offsets.bin"); //$NON-NLS-1$
-		}
-        var tmp = Paths.get(dir, temposFile);
-        if (!Files.exists(tmp)) {
-			tmp = Paths.get(dir, "tempos.bin"); //$NON-NLS-1$
-		}
-        if (!Files.exists(off) || !Files.exists(tmp)) {
-            System.err.println("Skipping " + name + ": offsets/tempos file not found alongside " + romFile); //$NON-NLS-1$ //$NON-NLS-2$
+        // The bare names are a fallback for dumps that predate the per-part
+        // naming. Refuse one that another part has already taken, since the
+        // same offsets or tempos cannot belong to two different devices.
+        final var off = resolve(dir, offsetsFile, "offsets.bin", name, claimed); //$NON-NLS-1$
+        final var tmp = resolve(dir, temposFile, "tempos.bin", name, claimed); //$NON-NLS-1$
+        if (off == null || tmp == null) {
+            System.err.println("Skipping " + name + ": no usable offsets/tempos file alongside " + romFile); //$NON-NLS-1$ //$NON-NLS-2$
             return null;
         }
 
         final var romBytes = Files.readAllBytes(rom);
         if (romBytes.length != EXPECTED_ROM_BYTES) {
-            System.err.println("Warning: " + romFile + " is " + romBytes.length //$NON-NLS-1$ //$NON-NLS-2$
-                    + " bytes; expected " + EXPECTED_ROM_BYTES + ". Continuing anyway."); //$NON-NLS-1$ //$NON-NLS-2$
+            System.err.println("Skipping " + name + ": " + romFile + " is " + romBytes.length //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+                    + " bytes; the note ROM must be exactly " + EXPECTED_ROM_BYTES + "."); //$NON-NLS-1$ //$NON-NLS-2$
+            return null;
+        }
+
+        final int[] offsets;
+        try {
+            offsets = parseOffsets(Files.readAllBytes(off));
+            validateOffsets(offsets);
+        }
+        catch (final IllegalArgumentException e) {
+            System.err.println("Skipping " + name + ": " + off.getFileName() + ": " + e.getMessage()); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+            return null;
         }
 
         final var c = new Chip();
         c.name = name;
         c.notes = decodeNotes(romBytes);
-        c.offsets = parseOffsets(Files.readAllBytes(off));
+        c.offsets = offsets;
         c.tempos = parseTempos(Files.readAllBytes(tmp));
-        c.songCount = countRealSongs(c.offsets);
+        c.dataEnd = lastSoundingWord(c.notes);
+        c.songCount = countRealSongs(c.offsets, c.dataEnd);
+
+        if (c.songCount == 0) {
+            System.err.println("Skipping " + name + ": no melody pointer addresses any sounding word."); //$NON-NLS-1$ //$NON-NLS-2$
+            return null;
+        }
+
+        warnUnknownTones(c);
         return c;
+    }
+
+    /**
+     * Pick the per-part file, falling back to the bare name only if no other
+     * part has claimed it.
+     *
+     * @param dir Directory to look in.
+     * @param preferred Per-part file name.
+     * @param fallback Bare file name kept for older dumps.
+     * @param chip Part being loaded, used for messages.
+     * @param claimed Files already taken by another part.
+     * @return The file to read, or null if none is usable.
+     */
+    static Path resolve(final String dir, final String preferred, final String fallback,
+                        final String chip, final Set<Path> claimed) {
+        final var first = Paths.get(dir, preferred);
+        if (Files.exists(first)) {
+            claimed.add(first.toAbsolutePath().normalize());
+            return first;
+        }
+
+        final var second = Paths.get(dir, fallback).toAbsolutePath().normalize();
+        if (!Files.exists(second)) {
+            return null;
+        }
+        if (!claimed.add(second)) {
+            System.err.println("Not using " + fallback + " for " + chip //$NON-NLS-1$ //$NON-NLS-2$
+                    + ": another part already used it. Rename it to " + preferred + "."); //$NON-NLS-1$ //$NON-NLS-2$
+            return null;
+        }
+        System.err.println("Note: " + chip + " is using the generic " + fallback //$NON-NLS-1$ //$NON-NLS-2$
+                + "; rename it to " + preferred + " to be unambiguous."); //$NON-NLS-1$ //$NON-NLS-2$
+        return Paths.get(dir, fallback);
+    }
+
+    /**
+     * Report tone codes that occur in this part's melodies but have no entry
+     * in its table, so that they are not silently dropped.
+     *
+     * @param c Chip to check.
+     */
+    static void warnUnknownTones(final Chip c) {
+        final var table = periodTableFor(c.name);
+        final var seen = new TreeSet<Integer>();
+        final var end = Math.min(c.dataEnd, TOTAL_NOTES - 1);
+        for (var i = 0; i <= end; i++) {
+            final var tone = c.notes[i][1];
+            if (tone != REST_TONE_RAW && tone != CONTROL_TONE_RAW && table[tone] <= 0) {
+                seen.add(Integer.valueOf(tone));
+            }
+        }
+        if (!seen.isEmpty()) {
+            System.err.println("Warning: " + c.name + " uses tone codes with no table entry: " //$NON-NLS-1$ //$NON-NLS-2$
+                    + seen + ". Those notes will be silent."); //$NON-NLS-1$
+        }
     }
 
     /**
@@ -855,6 +965,10 @@ public class UM348xDecoder {
      * entries of 12 packed bits, 32 bytes means 16 big-endian 16-bit words.
      */
     static int[] parseOffsets(final byte[] data) {
+        if (data.length != 24 && data.length != 32) {
+            throw new IllegalArgumentException("offsets file is " + data.length //$NON-NLS-1$
+                    + " bytes; expected 24 (12-bit packed) or 32 (16-bit big-endian)"); //$NON-NLS-1$
+        }
         if (data.length == 24) {
             final var entries = data.length * 8 / 12;
             final var out = new int[entries];
@@ -878,6 +992,23 @@ public class UM348xDecoder {
         return out;
     }
 
+    /**
+     * Reject pointer tables that cannot describe a melody layout: the first
+     * pointer must be in range, and the leading run must not decrease.
+     *
+     * @param offsets Parsed pointers.
+     * @throws IllegalArgumentException if the table is unusable.
+     */
+    static void validateOffsets(final int[] offsets) {
+        if (offsets.length == 0) {
+            throw new IllegalArgumentException("offsets table is empty"); //$NON-NLS-1$
+        }
+        if (offsets[0] < 0 || offsets[0] >= TOTAL_NOTES) {
+            throw new IllegalArgumentException("first melody pointer is " + offsets[0] //$NON-NLS-1$
+                    + ", outside 0.." + (TOTAL_NOTES - 1)); //$NON-NLS-1$
+        }
+    }
+
     static int[] parseTempos(final byte[] data) {
         final var out = new int[data.length];
         for (var i = 0; i < data.length; i++) {
@@ -890,18 +1021,37 @@ public class UM348xDecoder {
      * Real melodies are the strictly increasing leading pointers; the trailing
      * repeated filler value marks unused slots (section 2).
      */
-    static int countRealSongs(final int[] offsets) {
+    static int countRealSongs(final int[] offsets, final int dataEnd) {
+        if (offsets.length == 0) {
+            return 0;
+        }
         var n = 1;
         while (n < offsets.length && offsets[n] > offsets[n - 1] && offsets[n] < TOTAL_NOTES) {
-			n++;
-		}
-        // The first filler pointer is still strictly greater than the last real
-        // one, so it gets counted above; drop it when the value repeats
-        // immediately afterwards (the UM3481A dump ends 421, 499, 499, ...).
-        if (n < offsets.length && offsets[n] == offsets[n - 1]) {
-			n--;
-		}
+            n++;
+        }
+        // Pointers past the last sounding word address nothing but filler,
+        // whether or not the filler value happens to repeat.
+        while (n > 0 && offsets[n - 1] > dataEnd) {
+            n--;
+        }
         return n;
+    }
+
+    /**
+     * Index of the last word that can sound. Everything after it is filler:
+     * the UM3482A dump ends in 88 rest words, the UM3481A in 13.
+     *
+     * @param notes Decoded note words.
+     * @return Index of the last sounding word, or -1 if there is none.
+     */
+    static int lastSoundingWord(final int[][] notes) {
+        for (var i = notes.length - 1; i >= 0; i--) {
+            final var tone = notes[i][1];
+            if (tone != REST_TONE_RAW && tone != CONTROL_TONE_RAW) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     // ========================================================================
