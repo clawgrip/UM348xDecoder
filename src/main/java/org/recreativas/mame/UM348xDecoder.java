@@ -18,8 +18,8 @@ import java.util.Set;
 /**
  * ============================================================================
  *  UM348xDecoder
- *  Reverse-engineered ROM decoder and WAV synthesizer for the UM348x family
- *  of melody-generator ICs. Verified against two devices: the UM3481A
+ *  Reverse-engineered ROM decoder and WAV synthesizer for the UM348x family of
+ *  melody-generator ICs. Verified against two devices: the UM3481A
  *  (8 melodies) and the UM3482A (12 melodies).
  *
  *  Based on previous work from:
@@ -42,20 +42,22 @@ import java.util.Set;
  *
  *   <chip>tempos.bin  (16 bytes)   One byte per slot, from the ROM bank
  *                                  conventionally described as tempo. Its
- *                                  actual role is not established -- see
- *                                  sections 6 and 9.
+ *                                  actual role is not established (section 6).
+ *
+ * A fourth ROM area exists on the die, 8 words of 7 bits, and is described in
+ * section 7. It is not read by this program.
  *
  * No manufacturer documentation of the internal note/duration/tempo encoding
- * is published, so every parameter here was derived from the chips' own data
- * and calibrated against logic-level captures of real playback. Sections 1-8
- * describe what the data establishes; section 9 collects everything that
- * remains unknown, uncertain or unmodelled.
+ * is published, so every parameter here was derived from the devices' own data
+ * and calibrated against logic-level captures of real playback. Sections 1-10
+ * describe what the data establishes; section 11 collects what remains
+ * unknown or uncertain.
  *
  * Ground truth: four logic-level captures at 100 kHz -- two covering all 12
- * UM3482A melodies between them, and two covering 8 UM3481A melodies. All are
- * two-level signals (the raw square wave driving the speaker pin), which
+ * UM3482A melodies between them, and two covering all 8 UM3481A melodies. All
+ * are two-level signals (the raw square wave driving the speaker pin), which
  * allows sample-exact period and duration measurement. Methodology in
- * section 7.
+ * section 9.
  *
  * ----------------------------------------------------------------------------
  * 1. PHYSICAL NOTE-ROM ADDRESSING
@@ -65,43 +67,40 @@ import java.util.Set;
  * 8 "sub-columns" sharing the row; sub-column s (0-7) is bit s of the byte
  * (s = 0 -> least-significant).
  *
- * Melodies do NOT run through the sub-columns in the order 0..7. The logical
- * order is:
+ * Melodies run through the sub-columns in this order, not 0..7:
  *
  *     0, 1, 2, 3, 7, 6, 5, 4          (SUBCOLUMN_ORDER)
  *
- * i.e. the second half of the array is traversed in reverse, so:
+ * i.e. the second half of the array is traversed in reverse, so
  *
  *     noteIndex = position_in_SUBCOLUMN_ORDER * 64 + row      (0..511)
  *
  * Three independent lines of evidence fix this order:
  *
- *   - Melody continuity. Aligning a whole UM3481A recording against the ROM as
- *     one uninterrupted stream, the match runs perfectly for 190 notes and
- *     then stops dead at logical index 256 -- exactly a sub-column boundary
- *     (4 x 64). The notes that follow are found at physical sub-column 7, not
- *     4. Fixing the order to 0,1,2,3,7,6,5,4 makes every non-staccato melody
- *     in both UM3481A recordings align exactly with its slot: 58, 63, 41, 42,
- *     21, 57 and 56 notes, 100% of them, in slot order.
- *   - Slot pointers land correctly. A second UM3481A capture, holding that
- *     device's last melodies, aligns 134 of 134 notes starting precisely at
- *     ROM index 329, which is offsets[5] -- the start of slot 6.
- *   - UM3482A slot occupancy becomes sane. Under the naive 0..7 order that
- *     device has two slots containing nothing but rests and one slot of 97
- *     melodic words, three times any other. Under the correct order no slot is
- *     empty and slot sizes run a uniform 14 to 38 words.
+ *   - Melody continuity. Aligned as one uninterrupted stream, a UM3481A
+ *     recording matches the ROM for 190 notes and stops dead at logical index
+ *     256 -- exactly a sub-column boundary (4 x 64) -- with the notes that
+ *     follow found at physical sub-column 7. Under the order above, every
+ *     UM3481A melody aligns exactly with its slot: 58, 63, 41, 42, 52, 21, 57
+ *     and 56 notes, 100% of each, in slot order.
+ *   - Slot pointers land correctly. A capture holding that device's last
+ *     melodies aligns 134 of 134 notes starting precisely at ROM index 329,
+ *     which is offsets[5], the start of slot 6.
+ *   - UM3482A slot occupancy becomes sane: no slot is empty and slot sizes run
+ *     a uniform 14 to 38 words, where the naive 0..7 order gives two slots of
+ *     pure silence and one of 97 melodic words.
  *
  * ----------------------------------------------------------------------------
  * 2. NOTE WORD FORMAT AND SLOT POINTERS
  * ----------------------------------------------------------------------------
  * Each note is a 7-bit word read in the bit order the physical layout already
- * provides (group 0 = MSB, group 6 = LSB; no group permutation needed):
+ * provides (group 0 = MSB, group 6 = LSB; no group permutation):
  *
  *     bits 6-4 (3 bits)  ->  DURATION  (raw code 0-7)
  *     bits 3-0 (4 bits)  ->  TONE      (raw code 0-15)
  *
  * Tone code 3 is silence/rest on both devices: it opens most melody slots and
- * fills unused slots entirely. Tone code 1 is a silent control word
+ * fills unused space entirely. Tone code 1 is a silent control word
  * (section 3a). The other 14 codes are sounding notes.
  *
  * The two offset dumps use different bit packings, detected by file size:
@@ -111,25 +110,22 @@ import java.util.Set;
  *
  * The 12-bit reading is confirmed by its output: 0, 88, 165, 213, 271, 329,
  * 358, 421 followed by 499 repeated eight times -- eight strictly increasing
- * pointers for a chip with eight melodies, then a repeated filler value. No
- * other packing produces a sane result.
+ * pointers for a device with eight melodies, then a repeated filler value.
  *
- * This family is often described as offering 14 selectable tones, and on the
- * UM3482A alone that appears to hold, since tone codes 0 and 5 never occur in
- * its ROM. The UM3481A rules out any structural reading of this: it uses code
- * 5 heavily (61 occurrences) and code 0 once. Across both devices all 16 codes
- * occur, so codes 0 and 5 are simply unused by one song set, not reserved by
- * the hardware.
+ * The "14 selectable tones" figure often quoted for this family is a property
+ * of one song set rather than of the hardware: tone codes 0 and 5 never occur
+ * in the UM3482A ROM, but the UM3481A uses code 5 heavily (61 occurrences) and
+ * code 0 once. Across both devices all 16 codes occur.
  *
  * ----------------------------------------------------------------------------
  * 3. TONE -> FREQUENCY  (per-device lookup tables; the devices DIFFER)
  * ----------------------------------------------------------------------------
  * The mapping is a direct lookup, not a computable scale formula, and it is
- * not shared between the two devices. Each has its own table here.
+ * not shared between the two devices.
  *
- * UM3481A -- all 14 sounding codes present in its ROM are measured, from four
+ * UM3481A -- all 14 sounding codes present in its ROM are measured, from
  * melodies that align note-for-note with recordings, with no conflicting
- * readings anywhere:
+ * readings:
  *
  *     code  period  freq          code  period  freq
  *       0     202   495.05 Hz       9     106   943.40 Hz
@@ -140,66 +136,68 @@ import java.util.Set;
  *       7      72  1388.89 Hz      14     100  1000.00 Hz
  *       8     190   526.32 Hz      15      90  1111.11 Hz
  *
- * UM3482A -- seven codes measured, from three exactly-aligned melodies. Six
- * agree with the UM3481A values, but code 11 does not, and the disagreement is
- * large and unambiguous:
+ * UM3482A -- seven codes measured. Six agree with the UM3481A values, but code
+ * 11 does not, and the disagreement is large and unambiguous:
  *
  *     code 11 ->  254 samples =  393.70 Hz on the UM3482A
  *     code 11 ->   76 samples = 1315.79 Hz on the UM3481A
  *
  * Both readings come from exact alignments (2 observations on the UM3482A, 5
- * across three separate UM3481A melodies), so this is a genuine per-device
- * difference, not noise: the same code sits near the bottom of one device's
- * range and near the top of the other's. The overall ranges differ to match --
- * the UM3482A recordings never produce a period below 84 samples, while the
- * UM3481A regularly reaches 76 and 72. The UM3482A is voiced lower.
+ * across three separate UM3481A melodies), so the same code sits near the
+ * bottom of one device's range and near the top of the other's. The overall
+ * ranges differ to match: the UM3482A recordings never produce a period below
+ * 84 samples, while the UM3481A regularly reaches 76 and 72. The UM3482A is
+ * voiced lower.
  *
- * UM3482A codes 7, 9, 13, 14 and 15 have no measured value and are estimated;
- * see section 9.1 for how and why. Codes 0 and 5 never occur in the UM3482A
- * ROM, so they need no entry.
+ * UM3482A codes 7, 9, 13, 14 and 15 have no measured value and are estimated
+ * (11.1). Codes 0 and 5 never occur in that ROM.
  *
  * ----------------------------------------------------------------------------
  * 3a. TONE CODE 1 IS A CONTROL WORD, NOT A NOTE
  * ----------------------------------------------------------------------------
  * Raw tone code 1 produces no sound. In every passage that aligns exactly with
  * a recording, the first audible note corresponds to the ROM word AFTER the
- * tone-1 word, never to the tone-1 word itself. This holds independently on
+ * tone-1 word, never to the tone-1 word itself -- confirmed independently on
  * UM3481A slots 1 and 4 and on UM3482A slot 7.
  *
  * Where these words sit is informative. On the UM3482A a rest word immediately
- * followed by a tone-1 word occurs at ROM indices 103/104, 128/129, 160/161,
- * 194/195, 344/345, 404/405, 432/433, 485/486 and 504/505. The first four are
- * slot starts, but the last five are INSIDE slots 14, 15 and 16 -- slot 16
- * alone contains four. That fits other evidence that slot 16 (104 words, by
- * far the largest) holds several melodies rather than one, and that the
- * offsets table does not delimit songs one-to-one.
- *
- * The word is treated here as a rest: silent, but still consuming its word's
- * duration. What it selects, and whether it consumes time at all, are open --
- * see sections 9.2 and 9.3.
+ * followed by a tone-1 word occurs at nine places, of which four are slot
+ * starts and five are inside slots. It is treated here as a rest: silent, but
+ * consuming its word's duration. What it selects, and whether it consumes time
+ * at all, are open (11.2, 11.3).
  *
  * ----------------------------------------------------------------------------
  * 4. DURATION CODE -> TICKS
  * ----------------------------------------------------------------------------
- * Duration is a lookup too, and is not linear in the raw code. Relative
- * lengths measured from the exactly-aligned passages (standard deviation of
- * each figure under 1%), in units where the shortest observed word equals 1:
- *
- *     code 0 -> 1.000 (n=23)    code 6 -> 6.012 (n=11)
- *     code 3 -> 1.999 (n=43)    code 2 -> 7.484 (n= 2)
- *     code 7 -> 3.010 (n= 7)
- *     code 5 -> 3.995 (n= 2)
- *
- * Expressed in integers by taking the smallest duration (code 4) as 1 tick:
+ * Duration is a lookup, not linear in the raw code:
  *
  *     code : 0   1    2     3   4   5   6    7
  *     ticks: 2   3    15    4   1   8   12   6
  *
- * Codes 1, 2 and 4 are the uncertain entries; see section 9.4.
+ * Codes 0, 2, 3 and 6 are established by DIRECT COUNTING. In the staccato
+ * melody the device re-articulates each note once per tick (section 8), so the
+ * pulses can simply be counted, with no ratios, no multiplier and no
+ * calibration involved. An isolated capture of that melody gives 254 pulses
+ * across 52 notes and yields, with no exception anywhere:
  *
- * ADDITIVITY -- when consecutive ROM words share a tone code they sound as one
- * continuous note (section 5), and that note's length is the plain SUM of the
- * member words' ticks. Measured runs versus predicted sums:
+ *     code 0  -> 2 ticks   (24 independent notes, every one exactly 2 pulses)
+ *     code 3  -> 4 ticks   (24 independent notes, every one exactly 4 pulses)
+ *     code 2  -> 15 ticks  ( 4 independent notes, every one exactly 15 pulses)
+ *     codes 6+0 in a run -> 14 pulses, so code 6 = 12 ticks
+ *
+ * The value 15 for code 2 is therefore exact and not a rounding of 16: a
+ * fifteen-pulse note counted four times cannot be sixteen. The same holds for
+ * code 6 at 12.
+ *
+ * Codes 5 and 7 come from duration ratios measured on aligned melodies, in
+ * units where the shortest observed word is 1 (spread under 1%): code 5 at
+ * 3.995 and code 7 at 3.010, giving 8 and 6 ticks. Codes 1 and 4 are not
+ * measured (11.4).
+ *
+ * ADDITIVITY -- when consecutive words share a tone code, the resulting note's
+ * length is the plain SUM of the member words' ticks. The pulse counts confirm
+ * this exactly: a run of codes 6 and 0 counts 14 pulses against a predicted
+ * 12 + 2. Duration-ratio measurements agree:
  *
  *     run (3,3)   measured 3.997  predicted 3.999
  *     run (3,3,3) measured 5.990  predicted 5.998
@@ -207,40 +205,33 @@ import java.util.Set;
  *     run (5,3)   measured 6.015  predicted 5.994
  *
  * Because notes are rendered back to back with no gap, concatenating each
- * word's independently computed duration already performs this summation, so
- * no special merging logic is needed for timing.
+ * word's independently computed duration already performs this summation.
  *
  * ----------------------------------------------------------------------------
  * 5. CONSECUTIVE REPEATED-TONE WORDS
  * ----------------------------------------------------------------------------
- * A run of consecutive ROM words carrying the same tone code may be rendered
- * either as one sustained note or as several re-articulated ones -- alignment
- * against the recordings requires allowing both, and a melody generally
- * cannot be matched at all if runs are forced to collapse completely.
+ * A run of consecutive words carrying the same tone code may be rendered
+ * either as one sustained note or as several re-articulated ones; alignment
+ * against the recordings requires allowing both, and a melody generally cannot
+ * be matched at all if runs are forced to collapse completely.
  *
- * This distinction cannot be settled from the captures available, for a
- * mundane reason: the edge-extraction step used to read them merges any
- * uninterrupted stretch of one period into a single note event, so a genuine
- * re-articulation of the same pitch with no intervening silence is
- * indistinguishable from one long note. Any apparent absence of same-pitch
- * neighbours in the extracted data is an artefact of that step, not a
- * property of the device.
+ * Which of the two happens cannot be settled from these captures: the
+ * edge-extraction step used to read them merges any uninterrupted stretch of
+ * one period into a single event, so a re-articulation of the same pitch with
+ * no intervening silence is indistinguishable from one long note.
  *
- * Fortunately this does not affect synthesis. Whichever way a run is voiced,
- * its total length is the sum of the member words' ticks (section 4), and
- * notes are rendered back to back with no gap, so simply emitting each word in
- * turn produces the correct total duration either way. What does matter is
- * waveform CONTINUITY: if each word restarted its square wave at phase zero, a
- * run of equal-pitch words would acquire a discontinuity at every internal
- * boundary. A single song-wide sample counter supplies the phase instead, so
- * such runs render smoothly while genuine pitch changes still switch abruptly,
- * as the captures show.
+ * This does not affect synthesis. Either way the run's total length is the sum
+ * of the member words' ticks (section 4), and notes are rendered contiguously,
+ * so emitting each word in turn gives the correct total. What does matter is
+ * waveform CONTINUITY: a song-wide sample counter supplies the phase, so runs
+ * of equal pitch render without a discontinuity at each internal boundary,
+ * while genuine pitch changes still switch abruptly, as the captures show.
  *
  * ----------------------------------------------------------------------------
  * 6. TEMPO
  * ----------------------------------------------------------------------------
  * Tick length is always an integer multiple of a base unit of 20.48 ms (2048
- * samples at 100 kHz, i.e. 2^11). Four multipliers are observed across the two
+ * samples at 100 kHz, i.e. 2^11). Four multipliers occur across the two
  * devices, each pinned to a specific slot:
  *
  *     slot            tempo byte    multiplier    tick
@@ -248,48 +239,105 @@ import java.util.Set;
  *     UM3481A slot 2      44            4         81.92 ms
  *     UM3481A slot 3      41            6        122.88 ms
  *     UM3481A slot 4      80            3         61.44 ms
+ *     UM3481A slot 5      14            4         81.92 ms
  *     UM3481A slot 6      36            5        102.40 ms
  *     UM3481A slot 7      54            4         81.92 ms
  *     UM3481A slot 8      91            6        122.88 ms
  *     UM3482A slot 9     126            5        102.40 ms
- *     UM3482A slot 11     88            3         61.44 ms
  *
- * Each figure is the median of the per-note ratio between measured length and
+ * Each figure is the median per-note ratio between measured length and
  * predicted ticks across a fully aligned melody, and every one lands within
- * 0.1% of an integer.
+ * 0.1% of an integer. Slots not listed use the fallback multiplier of 5.
  *
- * Multipliers measured this way are applied per slot (see
- * TEMPO_MULTIPLIER_OVERRIDES); every other slot uses 5, the most frequently
- * observed value. Which multiplier a slot uses cannot currently be derived
- * from the ROM -- see section 9.5.
+ * What selects the multiplier is not established, and is not any of the data
+ * this program reads (11.5).
  *
  * ----------------------------------------------------------------------------
- * 7. VALIDATION METHODOLOGY
+ * 7. THE 8 x 7-BIT SELECTOR ROM
  * ----------------------------------------------------------------------------
- *   a. Each capture is binarized (two levels only) and rising edges are
- *      extracted; runs of equal cycle period become note events, long
- *      non-oscillating stretches become rests. Long rests split each capture
- *      into individual melodies.
+ * A fourth ROM area on the die holds 8 words of 7 bits. Its content is
+ * IDENTICAL on both devices:
+ *
+ *     word 0  0000110   (bits 1 and 2)
+ *     word 1  0001000   (bit 3)
+ *     word 2  1000000   (bit 6)
+ *     word 3  0000001   (bit 0)
+ *     word 4  0000010   (bit 1)
+ *     word 5  0000100   (bit 2)
+ *     word 6  0100000   (bit 5)
+ *     word 7  0010000   (bit 4)
+ *
+ * Seven of the eight words are one-hot, and between them they cover all seven
+ * bit positions exactly once -- a permutation of 7 lines. Word 0 is the sole
+ * exception, with two bits set. Being identical across two devices with
+ * entirely different song sets, it is fixed family-wide logic rather than
+ * per-song data, and its shape is that of a DECODER: a 3-bit index selecting
+ * one of seven output lines.
+ *
+ * Two readings are excluded by the playback data:
+ *
+ *   - It is not the duration table. As values it is {1,2,4,6,8,16,32,64},
+ *     which shares 1, 2, 4, 6 and 8 with the measured table but cannot
+ *     represent 12 or 15 ticks. Both are counted directly, pulse by pulse, in
+ *     the staccato melody (section 4), so neither can be a mis-measured 16.
+ *     Over all 40320 assignments of these values to the eight duration codes,
+ *     the best leaves a 12.1% error in some melody's total length, against
+ *     4.7% for the measured table.
+ *   - It is not the column-group bit order. Used as a bit permutation for the
+ *     7 groups it aligns zero notes, where the identity order aligns all 58 of
+ *     the first UM3481A melody.
+ *
+ * What it does select is open (11.6).
+ *
+ * ----------------------------------------------------------------------------
+ * 8. STACCATO / TREMOLO ARTICULATION
+ * ----------------------------------------------------------------------------
+ * One melody per device is rendered with every note chopped into short pulses
+ * separated by silence. The rule is exact: the device emits ONE PULSE PER
+ * TICK. From an isolated capture of the UM3481A's staccato melody:
+ *
+ *     pulses                254
+ *     pulse length          12.0 ms
+ *     gap between pulses    69.9 ms
+ *     onset to onset        81.93 ms  = one tick at multiplier 4 (81.92 ms)
+ *
+ * So the tone sounds for a fixed ~12 ms at the head of each tick and the rest
+ * of the tick is silent; the gap is a fixed length, not a proportion of the
+ * note. On the UM3482A the gap measures about 93 ms.
+ *
+ * Grouping consecutive equal-pitch pulses back into notes recovers the melody
+ * exactly: 254 pulses reduce to 52 notes whose tone codes match slot 5 word
+ * for word, and whose pulse counts match the tick counts of section 4 in every
+ * case. This makes the articulation the most precise measuring instrument
+ * available on these devices -- it renders the tick counter directly audible,
+ * which is what fixes four entries of the duration table by counting.
+ *
+ * The articulation is not reproduced by this program because nothing in the
+ * note words marks the melodies that use it (11.7); they render as ordinary
+ * sustained tones, correct in pitch and total duration but not in texture.
+ *
+ * ----------------------------------------------------------------------------
+ * 9. VALIDATION METHODOLOGY
+ * ----------------------------------------------------------------------------
+ *   a. Each capture is binarized (two levels only) and rising edges extracted;
+ *      runs of equal cycle period become note events, long non-oscillating
+ *      stretches become rests.
  *   b. Melodies are located in the ROM without presupposing slot boundaries.
- *      Two search modes are available. A canonical form (each distinct value
+ *      Two search modes are used. A canonical form (each distinct value
  *      renumbered by order of first appearance) compared by longest-common-
- *      subsequence needs no frequency table, so it can bootstrap one. Given a
- *      table, an exact search is possible instead: convert measured periods to
- *      tone codes and find ROM windows matching the pattern
- *      "code1+ code2+ ... codeN+", which both localizes the melody and
- *      recovers the exact word-to-note grouping.
- *   c. Every figure quoted in sections 3-6 comes from the exact search, which
- *      yields three UM3481A melodies at 57/59, 63/64 and 41/41 notes and the
- *      UM3482A slot 9 at 24/24, all with zero contradicting readings.
+ *      subsequence needs no frequency table and so can bootstrap one. Given a
+ *      table, an exact search is possible: convert measured periods to tone
+ *      codes and find ROM windows matching "code1+ code2+ ... codeN+", which
+ *      both localizes the melody and recovers the word-to-note grouping.
+ *   c. Every figure quoted in sections 3-8 comes from the exact search.
  *
- * A caution that governs how this evidence must be read: LCS alignment
- * guarantees the compared PATTERNS match but not that individual positions
- * correspond, when a melody revisits a pitch class. LCS-only readings can
- * therefore produce internally inconsistent frequency assignments, and are not
- * a sound basis for a lookup table. Only exact matches are used for that.
+ * One property of this evidence governs how it must be read: subsequence
+ * alignment guarantees the compared PATTERNS match but not that individual
+ * positions correspond, when a melody revisits a pitch class. Only exact
+ * matches are used for the lookup tables.
  *
  * ----------------------------------------------------------------------------
- * 8. AUDIO SYNTHESIS
+ * 10. AUDIO SYNTHESIS
  * ----------------------------------------------------------------------------
  * A pure two-level square wave, no envelope, no inter-note gap, with an
  * immediate frequency change at note boundaries (a single transitional cycle
@@ -297,133 +345,102 @@ import java.util.Set;
  * each song, per section 5.
  *
  * ----------------------------------------------------------------------------
- * 9. OPEN QUESTIONS, UNCERTAINTIES AND UNMODELLED BEHAVIOUR
+ * 11. OPEN QUESTIONS AND UNCERTAINTIES
  * ----------------------------------------------------------------------------
- * Everything below is either unknown, resting on thin evidence, or known to be
- * present in the hardware but deliberately not reproduced.
+ * 11.1 UM3482A TONE CODES 7, 9, 13, 14, 15 ARE ESTIMATED, NOT MEASURED.
+ *      None appears in a UM3482A passage that can be aligned exactly. They are
+ *      not given the UM3481A values, since code 11 shows the two tables can
+ *      differ drastically. Each is assigned a period the UM3482A is observed
+ *      to produce, preserving the relative pitch order those codes have on the
+ *      UM3481A. The only firm property of this estimate is that it cannot emit
+ *      a pitch the device is never seen to make; individual assignments may be
+ *      wrong. Affected slots are flagged "~" in the run output.
  *
- * 9.1  UM3482A TONE CODES 7, 9, 13, 14, 15 ARE ESTIMATED, NOT MEASURED.
- *      None appears in a UM3482A passage that could be aligned exactly. They
- *      are not given the UM3481A values, because code 11 demonstrates the two
- *      devices' tables can differ drastically. Each is instead assigned a
- *      period the UM3482A is actually observed to produce, preserving the
- *      relative pitch order those codes have on the UM3481A. The only firm
- *      property of this estimate is that it cannot emit a pitch the device is
- *      never seen to make; the individual assignments may well be wrong.
- *      Affected slots are flagged "~" in the run output.
+ * 11.2 WHAT THE TONE-1 CONTROL WORD SELECTS IS UNKNOWN.
+ *      Song-start marking, instrument or articulation select (11.7) and tempo
+ *      select are all consistent with where the word appears. Its duration
+ *      field varies between occurrences, which would suit a parameter-carrying
+ *      word.
  *
- * 9.2  WHAT THE TONE-1 CONTROL WORD SELECTS IS UNKNOWN.
- *      Candidates consistent with the data include song-start marking,
- *      instrument or articulation select (see 9.7) and tempo select. Its
- *      duration field varies between occurrences, which would suit a
- *      parameter-carrying word, but nothing confirms this.
+ * 11.3 WHETHER THE TONE-1 WORD CONSUMES TIME IS UNTESTED.
+ *      It is treated as a rest of its word's duration. Every instance that can
+ *      be checked against a recording lies before the first audible note,
+ *      where a capture cannot show whether time passed.
  *
- * 9.3  WHETHER THE TONE-1 WORD CONSUMES TIME IS UNTESTED.
- *      It is treated as a rest of its word's duration. Every instance that
- *      could be checked against a recording lies before the first audible
- *      note, where a capture cannot show whether time passed.
+ * 11.4 DURATION CODES 1 AND 4 ARE NOT MEASURED, AND CANNOT BE FROM THE
+ *      UM3481A. On that device neither code ever appears on a sounding note --
+ *      only on rests and control words -- so no amount of further UM3481A
+ *      audio can pin them, including the pulse-counting method of section 8.
+ *      They can only come from an alignable UM3482A melody that uses them, or
+ *      from a dump of the duration table itself. Codes 5 and 7 are one step
+ *      weaker than the rest of the table, resting on duration ratios rather
+ *      than on counted pulses.
  *
- * 9.4  DURATION CODES 1, 2 AND 4 ARE THE WEAK ENTRIES.
- *      Codes 1 and 4 rest on limited UM3482A observations. Code 2 rests on
- *      two observations; its measured 15 ticks breaks the otherwise tidy
- *      1,2,3,4,6,8,12 progression, in which 16 would fit. The measurement
- *      (7.484 x code 0, sd 0.003) is followed here, but with low confidence.
+ * 11.5 THE TEMPO MULTIPLIER'S SOURCE IS UNIDENTIFIED.
+ *      It is not the tempo byte: bytes 72 and 36 both yield 5, bytes 44 and 54
+ *      both yield 4, bytes 41 and 91 both yield 6, and byte 80 yields 3, with
+ *      no linear, proportional, modular, bitwise or bit-reversed function
+ *      fitting. That ROM is in any case suspect as per-song data, since the two
+ *      devices carry entirely different song sets yet share 13 of its 16 byte
+ *      values, with positions 1-8 identical in both.
  *
- * 9.5  THE TEMPO MULTIPLIER CANNOT BE DERIVED FROM THE TEMPO BYTE.
- *      Nine multipliers are now measured. Bytes 72 and 36 both yield 5; bytes
- *      44 and 54 both yield 4; bytes 41 and 91 both yield 6; byte 80 yields 3.
- *      No linear, proportional, modular, bitwise or bit-reversed function of
- *      the byte fits, and pairs that agree are not related by any obvious
- *      transform.
+ *      Nor is it the slot header. Within the UM3481A the header shape predicts
+ *      all eight multipliers, but across devices it fails at once: UM3482A slot
+ *      9 opens with a rest of duration code 0 followed by a plain note -- the
+ *      shape that means 4 on the UM3481A -- and measures 5.
  *
- *      There is stronger evidence that this ROM is not per-song tempo data at
- *      all: the two devices carry entirely different song sets, yet their
- *      16-byte tempo ROMs share 13 of 16 byte values, with positions 1-8
- *      identical in both (44, 41, 80, 14, 36, 54, 91, 126) and the remainder
- *      looking like the same underlying sequence shifted by an insertion. A
- *      genuine per-song tempo table for two unrelated song sets would not
- *      agree like that.
+ * 11.6 WHAT THE 8 x 7 SELECTOR ROM DRIVES IS UNKNOWN.
+ *      Its structure and its identity across devices are established
+ *      (section 7), and two candidate roles are excluded there, but nothing in
+ *      the available data indexes it. Because it is a 3-bit-to-7-line decoder,
+ *      any field of exactly 3 bits could be its index -- the duration field of
+ *      a control word being the obvious candidate to test first.
  *
- *      A different source looks more promising and is worth pursuing: the
- *      multiplier correlates with the words at the head of each slot. On the
- *      UM3481A, slots whose second word is an ordinary note take multiplier 4
- *      (slots 2 and 7); slots whose second word is a rest with duration code 1
- *      take 6 (slots 3 and 8); slots whose second word is a control word with
- *      duration code 3 take 5 (slots 1 and 6); and the one slot whose control
- *      word carries duration code 1 takes 3 (slot 4). Every UM3481A slot fits
- *      this description, but with seven data points and four outcomes it could
- *      easily be coincidence, and it has not been checked against the UM3482A.
+ * 11.7 WHICH MELODY USES STACCATO ARTICULATION CANNOT BE PREDICTED.
+ *      The articulation itself is fully characterised (section 8), but nothing
+ *      in the note words marks the melodies that use it, so the selector lies
+ *      outside the note ROM.
  *
- *      Consequence: slots without a measured multiplier have correct pitch and
- *      correct relative rhythm but may play at the wrong absolute speed, by a
- *      ratio of 3/5, 4/5 or 6/5.
+ * 11.8 THE UM3482A RECORDINGS COME FROM A DIFFERENT SONG SET THAN ITS DUMP.
+ *      Only 3 of that device's 12 recorded melodies can be located in its ROM
+ *      -- but those three match perfectly, note for note. That split is the
+ *      informative part: a wrong decode or a corrupt dump would fail
+ *      everywhere, whereas some melodies matching exactly while others match
+ *      nowhere is what a mask revision looks like, with part of the song set
+ *      carried over and part replaced.
  *
- * 9.6  THE REAL UM3482A RECORDINGS FROM SEAN'S SITE AND ITS ROM DUMP DO NOT AGREE.
- *      Only 3 of that device's 12 recorded melodies can be located in its ROM,
- *      and the failures are not explained by the missing table entries: an
- *      exhaustive search over every injective assignment of the five
- *      unmeasured tone codes to the device's unassigned observed pitches
- *      produces no assignment that makes any further melody align. Nor is it a
- *      boundary problem -- with the tone table left entirely free, so that only
- *      the pattern of which notes repeat which has to match, those melodies
- *      still align nowhere in the ROM at all.
+ *      The mismatch is structural, not incidental. The recordings hold 479
+ *      notes; the ROM holds real data only up to index 424, everything beyond
+ *      being rest filler, and a word can produce at most one note. The first
+ *      recorded melody alone has 52 notes while the largest slot holds 38
+ *      words. The melodies that fail align nowhere even when the tone table is
+ *      left entirely free, so that only the pattern of which notes repeat which
+ *      has to match.
  *
- *      Two counts show the disagreement is structural. The recordings contain
- *      479 notes while the ROM holds 399 melodic words, and a word can only
- *      ever produce one note or be merged into one, so the recording cannot be
- *      generated by this ROM as decoded. Individually, the first recorded
- *      melody has 52 notes while the largest slot holds 38 words.
- *
- *      The likeliest explanations are that the UM3482A captures come from a
- *      different ROM revision than the dump, or that they were spliced when
- *      two melodies were removed to reduce file size, joining fragments of
- *      different melodies into what looks like one. Note that the UM3481A,
- *      whose captures were not spliced in this way, aligns perfectly.
- *
- * 9.7  STACCATO / TREMOLO ARTICULATION IS NOT REPRODUCED.
- *      One melody in each device's recordings (UM3481A melody 5, UM3482A
- *      melody 8) is rendered by the hardware with every note chopped into
- *      short pulses separated by ~72 ms of silence, roughly quadrupling the
- *      audible event count. This is presumably the "multi-instrument"
- *      capability the family is marketed with. Nothing in the 7-bit note words
- *      distinguishes these melodies, so the selector lives outside the note
- *      ROM. Those melodies render here as ordinary sustained tones.
- *
- * 9.8  THE UM3481A STACCATO MELODY (SLOT 5) IS THE ONE UNALIGNED UM3481A SONG.
- *      Every other melody on that device matches its slot exactly. Slot 5
- *      cannot be aligned because its articulation (9.7) multiplies the audible
- *      event count, so its tempo multiplier is unmeasured and it falls back to
- *      the default.
- *
- * 9.9  A PITCH-RANGE MECHANISM MAY EXIST OUTSIDE THE NOTE WORD.
- *      Across both devices 17 distinct note periods occur, while a single
- *      device's word format allows at most 14 sounding codes. Per-device
- *      tables account for this here, but whether the hardware really holds two
- *      independent tone ROMs, or one table plus an octave/range control, is
- *      not determined.
+ *      Consequence: for the UM3482A only slots 7, 9 and 11 have a direct
+ *      playback check, and only slot 9 yields a usable multiplier.
  *
  * ----------------------------------------------------------------------------
  * PER-SLOT CONFIDENCE
  * ----------------------------------------------------------------------------
- *   UM3481A slots       Highest confidence: each aligns exactly with a
- *   1,2,3,4,6,7,8       recording (58, 63, 41, 42, 21, 57 and 56 notes, all
- *                       100%), the device's full tone table is measured, and
- *                       each multiplier is read directly off the recording.
- *                       Generated length lands within 0.6-2.0% of the capture
- *                       for six of the seven, and 6.8% for the shortest.
- *   UM3481A slot 5      Pitch trustworthy (full measured tone table); tempo
- *                       multiplier unmeasured, and its staccato articulation
- *                       is not reproduced (9.7, 9.8).
+ *   UM3481A slots 1-8   Highest confidence: all eight align exactly with a
+ *                       recording (58, 63, 41, 42, 52, 21, 57 and 56 notes,
+ *                       100% of each), the device's full tone table is
+ *                       measured, and every multiplier is read directly off
+ *                       the recording. Generated length lands within 0.6-2.0%
+ *                       of the capture for seven of the eight, and 6.8% for
+ *                       the shortest. Slot 5 additionally uses staccato
+ *                       articulation, which is not reproduced (8, 11.7).
  *   UM3482A slots       These align with recordings; slot 9 also has its
- *   9 and 11            multiplier measured directly.
+ *   7, 9 and 11         multiplier measured directly.
  *   UM3482A slots       Marked "~" in the run output: these contain at least
  *   2,4,5,6,8,10,14,16  one tone code whose frequency is estimated rather than
- *                       measured (9.1). Pitch contour is right in outline but
+ *                       measured (11.1). Pitch contour is right in outline but
  *                       individual notes may be wrong.
  *   All other UM3482A   Decoded with the same tables, but that device's
  *   slots               recordings cannot be reconciled with its ROM dump
- *                       (9.6), so none of them has a direct playback check and
- *                       none has a measured multiplier.
+ *                       (11.8), so none has a direct playback check and none
+ *                       has a measured multiplier.
  *
  * ----------------------------------------------------------------------------
  * USAGE
@@ -435,7 +452,8 @@ import java.util.Set;
  * The input directory is scanned for either or both devices' ROM sets; each
  * device found is decoded and its melodies written as <chip>_melody_NN.wav.
  * Recognised note-ROM names are um3481araw.bin and um3482araw.bin; offsets and
- * tempos are located by matching prefix.
+ * tempos are located by matching prefix, falling back to the bare names
+ * offsets.bin / tempos.bin.
  * ============================================================================
  */
 public class UM348xDecoder {
@@ -508,15 +526,15 @@ public class UM348xDecoder {
         170,  // 4   588.24 Hz  measured (n= 8)
          -1,  // 5   never occurs in this ROM
         114,  // 6   877.19 Hz  measured (n= 4)
-         84,  // 7  1190.48 Hz  ESTIMATED, see 9.1
+         84,  // 7  1190.48 Hz  ESTIMATED, see 11.1
         190,  // 8   526.32 Hz  measured (n=11)
-        134,  // 9   746.27 Hz  ESTIMATED, see 9.1
+        134,  // 9   746.27 Hz  ESTIMATED, see 11.1
         126,  // 10  793.65 Hz  measured (n=15)
         254,  // 11  393.70 Hz  measured (n= 2)  <-- low, unlike UM3481A's 76
         150,  // 12  666.67 Hz  measured (n=15)
-         96,  // 13 1041.67 Hz  ESTIMATED, see 9.1
-        106,  // 14  943.40 Hz  ESTIMATED, see 9.1
-        100   // 15 1000.00 Hz  ESTIMATED, see 9.1
+         96,  // 13 1041.67 Hz  ESTIMATED, see 11.1
+        106,  // 14  943.40 Hz  ESTIMATED, see 11.1
+        100   // 15 1000.00 Hz  ESTIMATED, see 11.1
     };
 
     /** Codes whose period is an estimate rather than a measurement, per chip. */
@@ -544,14 +562,14 @@ public class UM348xDecoder {
     // Section 4: measured duration code -> ticks (smallest duration = 1).
     // ------------------------------------------------------------------
     static final int[] DURATION_TICKS = {
-         2,  // 0  measured
-         3,  // 1  uncertain, see 9.4
-        15,  // 2  measured n=2, low confidence, see 9.4
-         4,  // 3  measured
-         1,  // 4  uncertain, see 9.4
-         8,  // 5  measured
-        12,  // 6  measured
-         6   // 7  measured
+         2,  // 0  counted directly, 24 notes
+         3,  // 1  not measured, see 11.4
+        15,  // 2  counted directly, 4 notes
+         4,  // 3  counted directly, 24 notes
+         1,  // 4  not measured, see 11.4
+         8,  // 5  from duration ratios
+        12,  // 6  counted directly, in a run
+         6   // 7  from duration ratios
     };
 
     static int ticksForDuration(final int durationCode) {
@@ -571,17 +589,18 @@ public class UM348xDecoder {
     static {
         // UM3481A: every non-staccato melody aligns exactly with its slot, so
         // each multiplier below is read straight off the recording.
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:1",  Integer.valueOf(5)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:2",  Integer.valueOf(4)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:3",  Integer.valueOf(6)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:4",  Integer.valueOf(3)); //$NON-NLS-1$
-        // slot 5 is the staccato melody and could not be aligned
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:6",  Integer.valueOf(5)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:7",  Integer.valueOf(4)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:8",  Integer.valueOf(6)); //$NON-NLS-1$
-        // UM3482A: only these two slots align cleanly, see 9.8.
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3482A:9",  Integer.valueOf(5)); //$NON-NLS-1$
-        TEMPO_MULTIPLIER_OVERRIDES.put("UM3482A:11", Integer.valueOf(3)); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:1", 5); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:2", 4); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:3", 6); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:4", 3); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:5", 4);   // staccato melody, see section 8 //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:6", 5); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:7", 4); //$NON-NLS-1$
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3481A:8", 6); //$NON-NLS-1$
+        // UM3482A: slot 9 is the only one whose alignment is clean enough to
+        // measure (deviation 0.6%; every other candidate alignment on that
+        // device yields a non-integer multiplier).
+        TEMPO_MULTIPLIER_OVERRIDES.put("UM3482A:9", 5); //$NON-NLS-1$
     }
 
     static int tempoMultiplier(final String chip, final int slot1Based) {
@@ -678,7 +697,7 @@ public class UM348xDecoder {
                     + DEFAULT_TEMPO_MULTIPLIER + " (section 6)"); //$NON-NLS-1$
             if ("UM3482A".equals(chip.name)) { //$NON-NLS-1$
                 System.out.println("  ~ slot contains a tone code whose frequency is estimated, " //$NON-NLS-1$
-                        + "not measured (see 9.1)"); //$NON-NLS-1$
+                        + "not measured (see 11.1)"); //$NON-NLS-1$
             }
             System.out.println();
         }
