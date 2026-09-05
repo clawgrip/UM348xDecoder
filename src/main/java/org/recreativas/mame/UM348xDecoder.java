@@ -737,7 +737,7 @@ public class UM348xDecoder {
 
     static int tempoMultiplier(final String chip, final int slot1Based) {
         final var m = TEMPO_MULTIPLIER_OVERRIDES.get(chip + ":" + slot1Based); //$NON-NLS-1$
-        return m != null ? m : DEFAULT_TEMPO_MULTIPLIER;
+        return m != null ? m.intValue() : DEFAULT_TEMPO_MULTIPLIER;
     }
 
     static double noteDurationMs(final int durationCode, final int multiplier) {
@@ -826,15 +826,15 @@ public class UM348xDecoder {
                 final var audio = synthesizeSong(chip.name, chip.notes, start, end, mult);
                 final var melodic = countMelodic(chip.notes, start, end);
 
-                final var filename = String.format(Locale.ROOT, "%s_melody_%02d.wav", chip.name.toLowerCase(), slot + 1); //$NON-NLS-1$
+                final var filename = String.format(Locale.ROOT, "%s_melody_%02d.wav", chip.name.toLowerCase(), Integer.valueOf(slot + 1)); //$NON-NLS-1$
                 writeWav(Paths.get(outputDir, filename).toString(), audio, SAMPLE_RATE);
 
                 final var measured = TEMPO_MULTIPLIER_OVERRIDES.containsKey(chip.name + ":" + (slot + 1)); //$NON-NLS-1$
                 final var estTone = slotUsesEstimatedTone(chip.name, chip.notes, start, end);
                 System.out.printf(Locale.ROOT, "%-4d %-7d %-7d %-7d %-7d %-6s %7.2f s  %-8d %-4s -> %s%n", //$NON-NLS-1$
-                        slot + 1, start, end, end - start + 1, tempoByte,
+                		Integer.valueOf(slot + 1), Integer.valueOf(start), Integer.valueOf(end), Integer.valueOf(end - start + 1), Integer.valueOf(tempoByte),
                         mult + (measured ? "*" : ""), //$NON-NLS-1$ //$NON-NLS-2$
-                        audio.length / (double) SAMPLE_RATE, melodic,
+                        Double.valueOf(audio.length / (double) SAMPLE_RATE), Integer.valueOf(melodic),
                         estTone ? "~" : "", filename); //$NON-NLS-1$ //$NON-NLS-2$
             }
             System.out.println("  * tempo multiplier measured directly; the rest use the fallback of " //$NON-NLS-1$
