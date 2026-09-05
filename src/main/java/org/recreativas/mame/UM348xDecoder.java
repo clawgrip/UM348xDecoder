@@ -27,16 +27,16 @@ import java.util.Set;
  * -----
  * Per device, three raw ROM dumps:
  *
- *   <chip>raw.bin     (448 bytes)  Main note ROM. 448 bytes = 3584 bits =
+ *   &lt;chip&gt;raw.bin     (448 bytes)  Main note ROM. 448 bytes = 3584 bits =
  *                                  64 rows x 56 columns, matching the physical
  *                                  cell array reported from die inspection of
  *                                  this family: 7 groups of 8 columns.
  *
- *   <chip>offsets.bin              Melody start pointers, one per addressable
+ *   &lt;chip&gt;offsets.bin              Melody start pointers, one per addressable
  *                                  slot (see section 2 for the two packings
  *                                  observed).
  *
- *   <chip>tempos.bin  (16 bytes)   One byte per slot, from the ROM bank
+ *   &lt;chip&gt;tempos.bin  (16 bytes)   One byte per slot, from the ROM bank
  *                                  conventionally described as tempo. Its
  *                                  actual role is not established (section 6).
  *
@@ -548,13 +548,18 @@ import java.util.Set;
  *
  * Both directories are optional (default: current directory, and "output").
  * The input directory is scanned for either or both devices' ROM sets; each
- * device found is decoded and its melodies written as <chip>_melody_NN.wav.
+ * device found is decoded and its melodies written as &lt;chip&gt;_melody_NN.wav.
  * Recognised note-ROM names are um3481araw.bin and um3482araw.bin; offsets and
  * tempos are located by matching prefix, falling back to the bare names
  * offsets.bin / tempos.bin.
  * ============================================================================
  */
 public class UM348xDecoder {
+
+    /** Utility class: not instantiable. */
+    private UM348xDecoder() {
+        // no instances
+    }
 
     // ------------------------------------------------------------------
     // Section 1: physical note-ROM geometry.
